@@ -29,7 +29,7 @@ import {
   getWalletHarmieHoldings,
   refreshVerifiedWallet,
 } from './collection-stats.js';
-import { handleVerify, startVerification, startOwnershipMonitor, startMagicEdenVerificationWithWallet } from './verify-bio.js';
+import { handleVerify, startVerification, startMagicEdenVerificationWithWallet } from './verify-bio.js';
 import { renderUnburnCard } from './unburn-card.js';
 import {
   findSiteHarmie,
@@ -541,39 +541,7 @@ async function handleMagicEdenVerify(interaction) {
   await interaction.showModal(modal);
 }
 
-async function startMagicEdenVerification(interaction, walletAddress) {
-  // Use the existing verification logic but adapt it for modal interaction
-  const userId = interaction.user.id;
-  const guildId = interaction.guildId;
 
-  // Generate verification code
-  const code = "BLUB-" + Math.random().toString(36).substring(2, 8).toUpperCase();
-
-  // Store verification data (we'll need to adapt the verify-bio.js logic)
-  // For now, let's create a simple response
-  await interaction.reply({
-    content: `🧾 **Magic Eden Bio Verification Started**
-
-**Your wallet:** \`${walletAddress}\`
-
-**Step 1:** Go to [Magic Eden](https://magiceden.io/) and sign in with this wallet
-**Step 2:** Go to your profile settings
-**Step 3:** Paste this code into your bio:
-
-\`${code}\`
-
-**Step 4:** Click "Save" and wait for verification (checked every minute)
-
-⏱ **Expires in 10 minutes**  
-✅ **Role:** HarmonyTown Resident
-
-The bot will automatically verify you once it detects the code in your Magic Eden bio and confirms you own Harmie NFTs.`,
-    ephemeral: true,
-  });
-
-  // TODO: Integrate with the existing verification system
-  // This would require modifying verify-bio.js to work with modal-collected wallet addresses
-}
 
 async function resolveBuysSalesChannel(guildId) {
   const guild = await client.guilds.fetch(guildId).catch(() => null);
@@ -1216,7 +1184,6 @@ client.once(Events.ClientReady, (readyClient) => {
   startWalletPolling();
   startPriceTracking(readyClient);
   startVerification(readyClient);
-  startOwnershipMonitor(readyClient);
   void logCisStatus();
   void postVerifyChannelMessage(readyClient);
 });

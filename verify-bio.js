@@ -1,32 +1,54 @@
+import { randomBytes } from "node:crypto";
 import axios from "axios";
+import bs58 from "bs58";
 import { config } from "./config.js";
+import { getWalletHarmieCount } from "./collection-stats.js";
+import { saveVerifiedWalletLink, logWalletAuditEvent } from "./wallet-store.js";
+import { botEvents } from "./bot-events.js";
 
 // ================= CONFIG =================
 const CONFIG = {
-  ROLE_NAME: config.discord.verifiedRoleName || "Harmony Town Resident",
-  COLLECTION_SYMBOL: config.solana.collectionSymbol || "harmie",
-  CHECK_INTERVAL_MS: 60 * 1000, // verify loop
-  EXPIRY_MS: 10 * 60 * 1000,
-  MONITOR_INTERVAL_MS: 5 * 60 * 1000, // 🔥 check ownership every 5 mins
-  HELIUS_API_KEY: process.env.HELIUS_API_KEY || "YOUR_HELIUS_API_KEY",
+  ROLE_NAME: config.discord.verifiedRoleName || "HarmonyTown Resident",
+  CHECK_INTERVAL_MS: 60 * 1000, // verify loop — check every 60s
+  EXPIRY_MS: 10 * 60 * 1000, // 10 minute window
 };
 
-// Pending verifications
+// Pending verifications (keyed by userId)
 const activeVerifications = new Map();
 
-// ✅ VERIFIED USERS STORE (wallet bound)
-const verifiedUsers = new Map();
+// Track which wallets are currently being verified to prevent duplicates
+const activeWallets = new Set();
 
 // ================ HELPERS =================
 
+/**
+ * Generate a cryptographically random verification code.
+ * Uses crypto.randomBytes instead of Math.random for unpredictability.
+ */
 function generateCode() {
-  return "BLUB-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  return "BLUB-" + randomBytes(4).toString("hex").toUpperCase().slice(0, 6);
 }
 
+/**
+ * Validate that a wallet address is a valid Solana base58 public key (32 bytes).
+ */
+function isValidSolanaAddress(wallet) {
+  if (!wallet || typeof wallet !== "string") return false;
+  try {
+    return bs58.decode(wallet).length === 32;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch the bio field from the Magic Eden user profile API.
+ * Endpoint: GET /v2/wallets/{wallet} → { walletAddress, bio }
+ */
 async function fetchMagicEdenBio(wallet) {
   try {
     const res = await axios.get(
-      `https://api-mainnet.magiceden.dev/v2/wallets/${wallet}`
+      `https://api-mainnet.magiceden.dev/v2/wallets/${encodeURIComponent(wallet)}`
     );
 
     return res.data?.bio || "";
@@ -36,32 +58,20 @@ async function fetchMagicEdenBio(wallet) {
   }
 }
 
+/**
+ * Check NFT ownership using the same DAS RPC that collection-stats.js uses.
+ * Returns { hasNFT: boolean, count: number }.
+ */
 async function checkNFTOwnership(wallet) {
   try {
-    const res = await axios.post(
-      `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_API_KEY}`,
-      {
-        jsonrpc: "2.0",
-        id: "1",
-        method: "getAssetsByOwner",
-        params: {
-          ownerAddress: wallet,
-          page: 1,
-          limit: 1000,
-        },
-      }
-    );
-
-    const assets = res.data.result.items || [];
-
-    return assets.some(
-      (nft) =>
-        nft?.collection?.symbol?.toLowerCase() ===
-        CONFIG.COLLECTION_SYMBOL
-    );
+    const result = await getWalletHarmieCount(wallet);
+    return {
+      hasNFT: result.count > 0,
+      count: result.count,
+    };
   } catch (err) {
-    console.error("NFT check error:", err.message);
-    return false;
+    console.error("NFT ownership check error:", err.message);
+    return { hasNFT: false, count: 0 };
   }
 }
 
@@ -72,139 +82,125 @@ function startVerification(client) {
     const now = Date.now();
 
     for (const [userId, data] of activeVerifications.entries()) {
+      // Expire old verifications
       if (now > data.expiry) {
         activeVerifications.delete(userId);
+        activeWallets.delete(data.wallet);
+        console.log(`⏱ Verification expired for ${userId}`);
         continue;
       }
 
+      // Fetch the user's Magic Eden bio
       const bio = await fetchMagicEdenBio(data.wallet);
       if (!bio) continue;
 
-      if (bio.includes(data.code)) {
-        console.log(`✅ Verified: ${userId}`);
+      // Check if the bio contains the verification code
+      if (!bio.includes(data.code)) continue;
 
-        const hasNFT = await checkNFTOwnership(data.wallet);
+      console.log(`✅ Bio code matched for ${userId}`);
 
-        if (!hasNFT) {
-          console.log(`❌ No NFT for ${userId}`);
-          activeVerifications.delete(userId);
-          continue;
-        }
+      // Check NFT ownership via the configured DAS RPC
+      const ownership = await checkNFTOwnership(data.wallet);
 
-        try {
-          const guild = client.guilds.cache.get(data.guildId);
-          const member = await guild.members.fetch(userId);
-
-          const role = guild.roles.cache.find(
-            (r) => r.name === CONFIG.ROLE_NAME
-          );
-
-          if (role) {
-            await member.roles.add(role);
-          }
-
-          // 🔥 STORE VERIFIED USER
-          verifiedUsers.set(userId, {
-            wallet: data.wallet,
-            guildId: data.guildId,
-          });
-
-          await member.send(
-            `✅ Verified!\nWallet: ${data.wallet}\nRole granted: ${CONFIG.ROLE_NAME}`
-          );
-        } catch (err) {
-          console.error("Role assign error:", err.message);
-        }
-
+      if (!ownership.hasNFT) {
+        console.log(`❌ No Harmie NFTs found for ${userId} (wallet: ${data.wallet})`);
         activeVerifications.delete(userId);
+        activeWallets.delete(data.wallet);
+        continue;
       }
+
+      console.log(`✅ Verified: ${userId} holds ${ownership.count} Harmie(s)`);
+
+      try {
+        // Save to the persistent wallet store (same as SIWS path)
+        const linkedWallet = saveVerifiedWalletLink({
+          discordUserId: userId,
+          guildId: data.guildId,
+          walletAddress: data.wallet,
+          walletLabel: "Magic Eden Bio",
+          harmieCount: ownership.count,
+          totalSupply: 500,
+          verificationMethod: "magic_eden_bio",
+        });
+
+        // Log the audit event
+        logWalletAuditEvent({
+          eventType: "verify_attempt",
+          status: "success",
+          discordUserId: userId,
+          walletAddress: data.wallet,
+          details: {
+            method: "magic_eden_bio",
+            harmieCount: ownership.count,
+          },
+        });
+
+        // Emit the wallet-linked event (triggers role grant + DM in index.js)
+        if (data.guildId) {
+          botEvents.emit("wallet-linked", {
+            guildId: data.guildId,
+            discordUserId: userId,
+            channelId: data.channelId || null,
+            walletAddress: data.wallet,
+          });
+        }
+      } catch (err) {
+        console.error("Wallet store / role assign error:", err.message);
+
+        // If it's a policy error (e.g., wallet already linked to another user),
+        // notify the user via DM
+        if (err.kind === "policy") {
+          try {
+            const guild = client.guilds.cache.get(data.guildId);
+            if (guild) {
+              const member = await guild.members.fetch(userId).catch(() => null);
+              if (member) {
+                await member.send(
+                  `❌ **Verification failed:** ${err.message}`
+                ).catch(() => { });
+              }
+            }
+          } catch {
+            // DM delivery is best-effort
+          }
+        }
+      }
+
+      activeVerifications.delete(userId);
+      activeWallets.delete(data.wallet);
     }
   }, CONFIG.CHECK_INTERVAL_MS);
 }
 
-// ============ OWNERSHIP MONITOR ============
-
-function startOwnershipMonitor(client) {
-  setInterval(async () => {
-    console.log("🔍 Running ownership check...");
-
-    for (const [userId, data] of verifiedUsers.entries()) {
-      const stillHasNFT = await checkNFTOwnership(data.wallet);
-
-      if (!stillHasNFT) {
-        console.log(`🚨 Removing role from ${userId}`);
-
-        try {
-          const guild = client.guilds.cache.get(data.guildId);
-          const member = await guild.members.fetch(userId);
-
-          const role = guild.roles.cache.find(
-            (r) => r.name === CONFIG.ROLE_NAME
-          );
-
-          if (role && member.roles.cache.has(role.id)) {
-            await member.roles.remove(role);
-          }
-
-          await member.send(
-            `⚠️ Your ${CONFIG.ROLE_NAME} role has been removed because you no longer hold a Harmie NFT.`
-          );
-        } catch (err) {
-          console.error("Role removal error:", err.message);
-        }
-
-        verifiedUsers.delete(userId);
-      }
-    }
-  }, CONFIG.MONITOR_INTERVAL_MS);
-}
-
 // ============== COMMAND HANDLER ==============
 
-async function handleVerify(interaction) {
-  const wallet = interaction.options.getString("wallet");
+/**
+ * Shared handler for both /verify and the Magic Eden Bio button flow.
+ * Creates a verification challenge and tells the user to paste a code into their ME bio.
+ */
+async function startBioVerification(interaction, walletAddress) {
   const userId = interaction.user.id;
+  const guildId = interaction.guildId;
 
-  if (!wallet || wallet.length < 32) {
+  if (!isValidSolanaAddress(walletAddress)) {
     return interaction.reply({
-      content: "❌ Invalid wallet address.",
+      content: "❌ Invalid Solana wallet address. Must be a valid base58 public key (32–44 characters).",
       ephemeral: true,
     });
   }
 
-  const code = generateCode();
-
-  activeVerifications.set(userId, {
-    wallet,
-    code,
-    expiry: Date.now() + CONFIG.EXPIRY_MS,
-    guildId: interaction.guildId,
-  });
-
-  await interaction.reply({
-    content: `🧾 **Verification Started**
-
-Paste this into your Magic Eden bio:
-
-\`${code}\`
-
-⏱ 10 minutes  
-🔄 Checked every minute  
-
-Role: **${CONFIG.ROLE_NAME}**`,
-    ephemeral: true,
-  });
-}
-
-async function startMagicEdenVerificationWithWallet(interaction, walletAddress) {
-  const userId = interaction.user.id;
-  const guildId = interaction.guildId;
-
-  if (!walletAddress || walletAddress.length < 32) {
+  // Prevent the same wallet from being verified by multiple users simultaneously
+  if (activeWallets.has(walletAddress)) {
     return interaction.reply({
-      content: "❌ Invalid wallet address.",
+      content: "❌ That wallet is already in an active verification session. Please wait for it to expire or try again later.",
       ephemeral: true,
     });
+  }
+
+  // If this user already has an active verification, clean it up
+  const existing = activeVerifications.get(userId);
+  if (existing) {
+    activeWallets.delete(existing.wallet);
   }
 
   const code = generateCode();
@@ -214,7 +210,9 @@ async function startMagicEdenVerificationWithWallet(interaction, walletAddress) 
     code,
     expiry: Date.now() + CONFIG.EXPIRY_MS,
     guildId,
+    channelId: interaction.channelId || null,
   });
+  activeWallets.add(walletAddress);
 
   await interaction.reply({
     content: `🧾 **Magic Eden Bio Verification Started**
@@ -229,7 +227,7 @@ async function startMagicEdenVerificationWithWallet(interaction, walletAddress) 
 
 **Step 4:** Click "Save" and wait for verification (checked every minute)
 
-⏱ 10 minutes  
+⏱ **Expires in 10 minutes**  
 🔄 Checked every minute  
 
 Role: **${CONFIG.ROLE_NAME}**`,
@@ -237,9 +235,25 @@ Role: **${CONFIG.ROLE_NAME}**`,
   });
 }
 
+/**
+ * Handle the /verify slash command.
+ * Reads the wallet from the command options.
+ */
+async function handleVerify(interaction) {
+  const wallet = interaction.options.getString("wallet");
+  await startBioVerification(interaction, wallet);
+}
+
+/**
+ * Handle the Magic Eden Bio button flow (after modal submit).
+ * Receives the wallet address from the modal.
+ */
+async function startMagicEdenVerificationWithWallet(interaction, walletAddress) {
+  await startBioVerification(interaction, walletAddress);
+}
+
 export {
   handleVerify,
   startVerification,
-  startOwnershipMonitor,
   startMagicEdenVerificationWithWallet,
 };
