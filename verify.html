@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Harmie Wallet Verification</title>
+    <link rel="stylesheet" href="/verify.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <header class="panel-header">
+          <p class="eyebrow">Harmie Bot</p>
+          <h1>Verify your wallet</h1>
+          <p class="lede">
+            Connect a Solana wallet and sign a message to link your Harmies to Discord. No
+            transaction, no approvals.
+          </p>
+        </header>
+
+        <div class="status" id="status">Loading verification request…</div>
+        <div class="meta" id="meta"></div>
+
+        <div class="mobile-hint" id="mobile-hint" hidden>
+          On mobile? Tap a wallet below to open this page inside its app.
+        </div>
+
+        <div class="wallets" id="wallets"></div>
+
+        <details class="message-toggle">
+          <summary>Preview signature message</summary>
+          <pre class="message" id="message"></pre>
+        </details>
+
+        <button class="button" id="verify-button" type="button" disabled>
+          Select a wallet to continue
+        </button>
+
+        <div class="result" id="result"></div>
+
+        <details class="message-toggle">
+          <summary>Debug info</summary>
+          <pre class="message" id="debug"></pre>
+        </details>
+      </section>
+    </main>
+
+    <script type="module" src="/verify.js"></script>
+  </body>
+</html>
